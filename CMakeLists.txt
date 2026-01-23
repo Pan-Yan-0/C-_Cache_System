@@ -22,3 +22,16 @@ add_executable(cacheStudy
 
 # main 依赖缓存库
 target_link_libraries(cacheStudy PRIVATE mycache)
+
+# ============================
+# Tests (CTest)
+# ============================
+enable_testing()
+
+add_executable(lru_tests
+        tests/test_lru.cpp
+)
+
+target_link_libraries(lru_tests PRIVATE mycache)
+
+add_test(NAME lru_tests COMMAND lru_tests)

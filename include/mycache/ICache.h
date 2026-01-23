@@ -48,6 +48,7 @@ namespace mycache {
         virtual size_t capacity() const = 0;
 
     public:
+        // 防止无法析构成功
         virtual ~ICache() = default;
     };
 }
