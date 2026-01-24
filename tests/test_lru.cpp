@@ -7,6 +7,13 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
+#include <random>
+#include <atomic>
+#include <chrono>
+#include <barrier>
+#include <condition_variable>
 
 namespace mycache {
 
@@ -212,18 +219,92 @@ namespace mycache {
 
     void test_capacity_zero() {
         LRUCache<int, int> c(0);
-        ASSERT_EQ(0,c.size());
-        ASSERT_EQ(0,c.capacity());
+        ASSERT_EQ(0, c.size());
+        ASSERT_EQ(0, c.capacity());
         bool put = c.put(1, 1);
         ASSERT_EQ(false, put);
         auto c_key1 = c.get(1);
         ASSERT_NO_VALUE(c_key1);
         bool erase = c.erase(1);
         ASSERT_EQ(false, erase);
-        ASSERT_EQ(0,c.size());
-        ASSERT_EQ(0,c.capacity());
+        ASSERT_EQ(0, c.size());
+        ASSERT_EQ(0, c.capacity());
     }
 
+    void test_concurrent_smoke() {
+
+        // create cache
+        const int thread_count = 8;
+        const int ops_per_thread = 2000000;
+        const int key_space = 30;
+
+        LRUCache<int, int> c(32);
+
+        // std::atomic<bool> start{false};
+
+        //std::barrier start_line(thread_count + 1); //thread_count + 1代表实际上总共有这么多个线程包括主线程
+
+        std::mutex m;
+        std::condition_variable cv_ready;
+        std::condition_variable cv_start;
+
+        int ready_count = 0;        // 到“起跑线”的 worker 数
+        bool start = false;         // 是否运行开跑
+
+
+        auto worker = [&](int tid) -> void {
+            std::mt19937 rng(static_cast<unsigned >(tid + 20260124));
+            std::uniform_int_distribution<int> key_dist(0, key_space - 1);
+            std::uniform_int_distribution<int> op_dist(0, 2);
+
+//            while (!start.load(std::memory_order_acquire)) {
+//                // 自选等待统一开始
+//            }
+
+//            start_line.arrive_and_wait();
+
+            {
+                std::unique_lock<std::mutex> lk(m);
+                ++ready_count;
+                cv_ready.notify_one();
+
+                cv_start.wait(lk, [&] { return start; });
+            }
+            for (int i = 0; i < ops_per_thread; ++i) {
+                int k = key_dist(rng);
+                int op = op_dist(rng);
+
+                if (op == 0) {
+                    c.put(k, k + i); // value 随意
+                } else if (op == 1) {
+                    (void) c.get(k);
+                } else {
+                    (void) c.erase(k);
+                }
+            };
+
+
+        };
+        std::vector<std::thread> threads;
+        threads.reserve(thread_count);
+        for (int t = 0; t < thread_count; ++t) {
+            threads.emplace_back(worker, t);
+        }
+        //start.store(true, std::memory_order_release);
+
+        //start_line.arrive_and_wait();
+
+        {
+            std::unique_lock<std::mutex> lk(m);
+            cv_ready.wait(lk, [&] { return ready_count == thread_count; });
+            start = true;
+        }
+        cv_start.notify_all();
+
+        for (auto &th: threads) th.join();
+
+        ASSERT_TRUE(c.size() <= c.capacity());
+    }
 } // namespace mycache
 
 int main() {
@@ -240,6 +321,7 @@ int main() {
     test_cover_write_and_value_or_recent_use();
     test_erase_put();
     test_capacity_zero();
+    test_concurrent_smoke();
     std::cout << "All tests passed." << std::endl;
     return 0;
 }

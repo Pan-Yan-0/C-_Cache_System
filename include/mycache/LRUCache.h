@@ -73,6 +73,7 @@
 #include <list>
 #include <unordered_map>
 #include <cassert>
+#include <mutex>
 
 namespace mycache {
     // 这里之后会放：LRUCache<K, V> 的声明与实现。
@@ -80,6 +81,14 @@ namespace mycache {
     //
     template<class K, class V>
     class LRUCache : public ICache<K, V> {
+    private:
+        // 各个成员变量的互斥量
+//        mutable std::mutex mt_capacity_;
+//        mutable std::mutex mt_size_;
+//        std::mutex mt_lst_;
+//        std::mutex mt_mp_;
+        mutable std::mutex mut_;
+
     private:
         size_t capacity_; // 最大容量
         size_t size_;     // 现存大小
@@ -96,7 +105,7 @@ namespace mycache {
         /*
          * @key : 推送的键值的键
          * @value : 推送的键值的值
-         *
+         * @return : 当写入成功返回true，写入不成功返回false
          * 特别的：capacity = 0时，始终返回false
          * */
         bool put(const K &key, const V &value) override;
@@ -129,10 +138,25 @@ namespace mycache {
 #ifndef NDEBUG
 
         void check_invariants_() const {
+            // 验证size_是否存在问题
             assert(size_ == lst_.size());
             assert(size_ == mp_.size());
             assert(lst_.size() == mp_.size());
+            // capacity == 0 的全禁用模式
+            if (capacity_ == 0){
+                assert(size_ == 0);
+                assert(lst_.empty());
+                assert(mp_.empty());
+            }
+
+            // assert(capacity_ == 0 && size_ == 0)
             assert(size_ <= capacity_);
+
+            // size == 0其他的 lst_ 和 mp_ 理应不存东西
+            if (size_ == 0) {
+                assert(lst_.empty());
+                assert(mp_.empty());
+            }
         }
 
 #else
@@ -153,13 +177,18 @@ namespace mycache {
 
     template<class K, class V>
     bool LRUCache<K, V>::put(const K &key, const V &value) {
+
+        std::lock_guard<std::mutex> lock_capacity(mut_);
         if (capacity_ == 0)return false;
         auto mapId = mp_.find(key);
+        // 找不到
         if (mapId == mp_.end()) {
+            // 容量充足，加链头即可
             if (size_ < capacity_) {
                 lst_.push_front({key, value});
                 size_++;
             } else {
+                // 满时 size_ 不变
                 auto lrb = lst_.rbegin();
                 mp_.erase(lrb->first);
                 lst_.pop_back();
@@ -167,10 +196,12 @@ namespace mycache {
             }
             mp_[key] = lst_.begin();
         } else {
+            // key存在，那么更新到链头，并更新值
             lst_.splice(lst_.begin(), lst_, mapId->second);
             lst_.begin()->second = value;
         }
         check_invariants_();
+
 
         return true;
     }
@@ -178,6 +209,7 @@ namespace mycache {
     template<class K, class V>
     std::optional<V> LRUCache<K, V>::get(const K &key) {
 
+        std::lock_guard<std::mutex> lock_capacity(mut_);
         if (capacity_ == 0) return std::nullopt;
         auto mapIt = mp_.find(key);
         // 肯定是看找不找得到，找不到就不管是否现在是空都可以直接返回了，懒得用那个
@@ -188,13 +220,18 @@ namespace mycache {
             lst_.splice(lst_.begin(), lst_, nodeIt);
             check_invariants_();
 
-            return std::optional<V>(nodeIt->second);
+            return std::optional<V>(lst_.begin()->second);
         }
+
+
     }
 
     template<class K, class V>
     bool LRUCache<K, V>::erase(const K &key) {
-        if (capacity_ == 0 || size_ == 0) {
+
+        std::lock_guard<std::mutex> lock_mp(mut_);
+
+        if (capacity_ == 0 || mp_.empty()) {
             return false;
         } else {
             auto mapId = mp_.find(key);
@@ -204,18 +241,21 @@ namespace mycache {
             mp_.erase(key);
             size_--;
             check_invariants_();
-
             return true;
         }
+
+
     }
 
     template<class K, class V>
     size_t LRUCache<K, V>::size() const {
+        std::lock_guard<std::mutex> lock_size(mut_);
         return size_;
     }
 
     template<class K, class V>
     size_t LRUCache<K, V>::capacity() const {
+        std::lock_guard<std::mutex> lock_capacity(mut_);
         return capacity_;
     }
 
