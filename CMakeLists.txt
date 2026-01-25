@@ -9,6 +9,7 @@ add_library(mycache STATIC
         src/dummy.cpp
         include/mycache/ICache.h
         include/mycache/LRUCache.h
+        include/mycache/LFUCache.h
 )
 
 # PUBLIC：mycache 自己编译需要；链接到 mycache 的目标也会继承该 include 路径

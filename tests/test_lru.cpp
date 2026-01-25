@@ -281,7 +281,7 @@ namespace mycache {
                 } else {
                     (void) c.erase(k);
                 }
-            };
+            }
 
 
         };

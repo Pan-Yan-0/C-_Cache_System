@@ -43,9 +43,9 @@ namespace mycache {
         // 擦除
         virtual bool erase(const K &key) = 0;
         // 当前存储个数
-        virtual size_t size() const = 0;
+        [[nodiscard]] virtual size_t size() const = 0;
         // 最大容量
-        virtual size_t capacity() const = 0;
+        [[nodiscard]] virtual size_t capacity() const = 0;
 
     public:
         // 防止无法析构成功
