@@ -1,6 +1,24 @@
 //
 // Created by py on 26-1-23.
 //
+// =============================================================================
+// tests/test_lru.cpp
+// =============================================================================
+// 说明：
+// 1) 这是 LRUCache 的“策略专项测试”。
+//    - ICache 的通用语义（put/get/erase/capacity==0 等）已在 test_icache_basic.cpp 覆盖。
+//    - 这里重点验证：LRU 的淘汰顺序、覆盖写是否影响“最近使用”、以及 erase 相关边界。
+//
+// 2) 测试风格：AAA（Arrange / Act / Assert）
+//    - Arrange：准备缓存和初始数据
+//    - Act：执行 put/get/erase
+//    - Assert：断言命中/淘汰/size 等
+//
+// 3) 并发测试说明：
+//    - 并发 smoke test 只验证“不崩溃 + size<=capacity”。
+//    - 不验证并发下严格淘汰顺序/返回值一致性（线程调度不可控，易产生脆弱测试）。
+// =============================================================================
+
 #include "mycache/LRUCache.h"
 
 #include <cstdlib>
@@ -10,18 +28,20 @@
 #include <thread>
 #include <vector>
 #include <random>
-#include <atomic>
-#include <chrono>
-#include <barrier>
 #include <condition_variable>
+
+// 注意：本文件在并发 smoke test 中会直接使用 std::thread（见 test_concurrent_smoke 的 std::vector<std::thread>）。
+// 某些 clangd/静态分析会在解析不完整或索引未更新时误报 unused include；保持此 include 更稳妥。
 
 namespace mycache {
 
 // ============================
 // 最小断言工具（不依赖第三方库）
 // ============================
-// 约定：断言失败就打印位置 + 期望/实际，并直接退出进程（让 CTest 判定失败）。
-
+// 约定：断言失败 -> 打印失败位置与信息 -> exit(1)
+// 好处：
+// - 不引入第三方测试框架，也能完成回归验证
+// - 失败时能快速定位到哪一行
 #define MYCACHE_FAIL(msg)                                                                    \
     do {                                                                                     \
         std::cerr << "[TEST FAILED] " << __FILE__ << ":" << __LINE__ << " - " << msg      \
@@ -59,8 +79,10 @@ namespace mycache {
 // ============================
 
     void test_put_get_basic() {
+        // Arrange
         LRUCache<int, int> c(2);
 
+        // Act + Assert
         // 初始：get miss
         auto v0 = c.get(1);
         ASSERT_NO_VALUE(v0);
@@ -77,18 +99,21 @@ namespace mycache {
     }
 
     void test_lru_eviction_order() {
+        // Arrange
         // capacity=2：放入 1,2；访问 1；再放 3 -> 应淘汰 2
         LRUCache<int, int> c(2);
 
+        // Act
         c.put(1, 10);
         c.put(2, 20);
 
-        auto hit1 = c.get(1);
+        auto hit1 = c.get(1); // 1 变为 MRU
         ASSERT_HAS_VALUE(hit1);
         ASSERT_EQ(10, *hit1);
 
-        c.put(3, 30);
+        c.put(3, 30); // 触发淘汰
 
+        // Assert
         auto miss2 = c.get(2);
         auto hit1_again = c.get(1);
         auto hit3 = c.get(3);
@@ -102,8 +127,10 @@ namespace mycache {
     }
 
     void test_erase() {
+        // Arrange
         LRUCache<std::string, int> c(2);
 
+        // Act + Assert
         // 空缓存 erase
         ASSERT_FALSE(c.erase("nope"));
 
@@ -124,8 +151,10 @@ namespace mycache {
     }
 
     void test_put_same_key_does_not_grow_size() {
+        // Arrange
         LRUCache<int, int> c(2);
 
+        // Act
         c.put(1, 100);
         ASSERT_EQ(static_cast<size_t>(1), c.size());
 
@@ -133,28 +162,29 @@ namespace mycache {
         c.put(1, 200);
         ASSERT_EQ(static_cast<size_t>(1), c.size());
 
+        // Assert
         auto v = c.get(1);
         ASSERT_HAS_VALUE(v);
         ASSERT_EQ(200, *v);
     }
 
     void test_volumn_by_one_lru() {
-        // 测试capacity为 1 下 lru 的工作情况
+        // capacity=1 的边界：任何新 key 插入都会淘汰旧 key
         LRUCache<int, int> lruCache(1);
         lruCache.put(1, 1);
         ASSERT_EQ(static_cast<size_t>(1), lruCache.size());
 
-        // 重复放入测试
+        // 覆盖写同 key，不应该改变 size
         lruCache.put(1, 100);
-        ASSERT_EQ(1, lruCache.size());
+        ASSERT_EQ(static_cast<size_t>(1), lruCache.size());
 
         auto g = lruCache.get(1);
         ASSERT_HAS_VALUE(g);
-        // ASSERT_HAS_VALUE(g.has_value());
         ASSERT_EQ(100, *g);
 
+        // 插入新 key，旧 key 被淘汰
         lruCache.put(2, 200);
-        ASSERT_EQ(1, lruCache.size());
+        ASSERT_EQ(static_cast<size_t>(1), lruCache.size());
         g = lruCache.get(2);
         ASSERT_HAS_VALUE(g);
         ASSERT_EQ(200, *g);
@@ -164,25 +194,29 @@ namespace mycache {
     }
 
     void test_use_get_many_times_look_the_size() {
+        // 重复 get 不应改变 size
         LRUCache<int, int> c(2);
         c.put(1, 1);
         auto c_key1 = c.get(1);
         ASSERT_HAS_VALUE(c_key1);
         ASSERT_EQ(1, *c_key1);
-        ASSERT_EQ(1, c.size());
+        ASSERT_EQ(static_cast<size_t>(1), c.size());
+
         c_key1 = c.get(1);
         ASSERT_HAS_VALUE(c_key1);
         ASSERT_EQ(1, *c_key1);
-        ASSERT_EQ(1, c.size());
+        ASSERT_EQ(static_cast<size_t>(1), c.size());
     }
 
     void test_cover_write_and_value_or_recent_use() {
+        // 覆盖写会更新 value，同时也应视作“最近使用”（避免被当作 LRU 淘汰）
         LRUCache<int, int> c(2);
         c.put(1, 1);
         c.put(2, 2);
 
-        c.put(1, 100);
-        c.put(3, 1);
+        c.put(1, 100); // 覆盖写：1 变为 MRU
+        c.put(3, 1);   // 淘汰应发生在 2
+
         auto c_key1 = c.get(1);
         ASSERT_HAS_VALUE(c_key1);
         ASSERT_EQ(100, *c_key1);
@@ -197,6 +231,7 @@ namespace mycache {
     }
 
     void test_erase_put() {
+        // erase 后再 put：不应出现 iterator/map 不一致问题
         LRUCache<int, int> c(2);
         c.put(1, 1);
         c.put(2, 2);
@@ -204,9 +239,12 @@ namespace mycache {
         c.erase(1);
         auto c_key1 = c.get(1);
         ASSERT_NO_VALUE(c_key1);
-        ASSERT_EQ(1, c.size());
+        ASSERT_EQ(static_cast<size_t>(1), c.size());
+
         c.put(3, 3);
         c.put(4, 4);
+
+        // 最终应淘汰 2（取决于实现细节：这里的断言用于回归验证你当前语义）
         auto c_key2 = c.get(2);
         ASSERT_NO_VALUE(c_key2);
 
@@ -218,38 +256,38 @@ namespace mycache {
     }
 
     void test_capacity_zero() {
+        // capacity==0：禁用缓存语义
         LRUCache<int, int> c(0);
-        ASSERT_EQ(0, c.size());
-        ASSERT_EQ(0, c.capacity());
+        ASSERT_EQ(static_cast<size_t>(0), c.size());
+        ASSERT_EQ(static_cast<size_t>(0), c.capacity());
         bool put = c.put(1, 1);
         ASSERT_EQ(false, put);
         auto c_key1 = c.get(1);
         ASSERT_NO_VALUE(c_key1);
         bool erase = c.erase(1);
         ASSERT_EQ(false, erase);
-        ASSERT_EQ(0, c.size());
-        ASSERT_EQ(0, c.capacity());
+        ASSERT_EQ(static_cast<size_t>(0), c.size());
+        ASSERT_EQ(static_cast<size_t>(0), c.capacity());
     }
 
     void test_concurrent_smoke() {
 
-        // create cache
+        // 并发 smoke：验证“单锁实现”在多线程下不崩溃。
+        // - 使用 condition_variable 做起跑线，增加交错概率。
+        // - 最后断言 size<=capacity（并发下最终结果不做确定性断言）。
+
         const int thread_count = 8;
         const int ops_per_thread = 2000000;
         const int key_space = 30;
 
         LRUCache<int, int> c(32);
 
-        // std::atomic<bool> start{false};
-
-        //std::barrier start_line(thread_count + 1); //thread_count + 1代表实际上总共有这么多个线程包括主线程
-
         std::mutex m;
         std::condition_variable cv_ready;
         std::condition_variable cv_start;
 
         int ready_count = 0;        // 到“起跑线”的 worker 数
-        bool start = false;         // 是否运行开跑
+        bool start = false;         // 主线程发令开跑
 
 
         auto worker = [&](int tid) -> void {
@@ -257,12 +295,7 @@ namespace mycache {
             std::uniform_int_distribution<int> key_dist(0, key_space - 1);
             std::uniform_int_distribution<int> op_dist(0, 2);
 
-//            while (!start.load(std::memory_order_acquire)) {
-//                // 自选等待统一开始
-//            }
-
-//            start_line.arrive_and_wait();
-
+            // 起跑线
             {
                 std::unique_lock<std::mutex> lk(m);
                 ++ready_count;
@@ -290,9 +323,6 @@ namespace mycache {
         for (int t = 0; t < thread_count; ++t) {
             threads.emplace_back(worker, t);
         }
-        //start.store(true, std::memory_order_release);
-
-        //start_line.arrive_and_wait();
 
         {
             std::unique_lock<std::mutex> lk(m);

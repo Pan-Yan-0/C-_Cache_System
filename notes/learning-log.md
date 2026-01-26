@@ -404,3 +404,81 @@
   - put 已存在 key 会提升 freq
   - erase 行为 + erase 后再 put 的边界
   - capacity==0
+
+---
+
+## Step 7：给 LFUCache 做“库化注释” + 完善测试注释 + 测试分层
+
+### 这次对话在做什么
+- 你已经把 `LFUCache` 的实现（分桶 + `minFreq_` + 单锁 + Debug 不变量）跑通，并且 LFU 的专项测试也稳定通过。
+- 接下来我们做的是“工程化收尾”：
+  1) 让 `include/mycache/LFUCache.h` 更像一个可复用的小库（清晰的契约、复杂度、线程安全说明、关键数据结构解释）。
+  2) 给三份测试文件补上更详细的中文注释，方便未来扩展/回归。
+  3) 把这些内容记录进学习日志。
+
+### 目标（为什么要写这么多注释）
+- 对新手来说：
+  - 注释相当于“读代码的导航”，能把实现背后的设计意图写清楚。
+- 对工程来说：
+  - 未来你做 ARC、分片缓存、性能优化时，注释里的“契约/不变量/复杂度”就是你判断“改动有没有破坏行为”的依据。
+
+### LFUCache.h 的“库化注释”做了什么
+文件：`include/mycache/LFUCache.h`
+
+补充了以下信息：
+- **策略说明**：LFU 优先淘汰最小频次；同频次按桶内 LRU 淘汰（back）。
+- **复杂度声明**：get/put/erase 期望 O(1)（建立在 `unordered_map` 均摊 O(1) 上）。
+- **线程安全语义**：
+  - 单把大锁 `mtx_` 保护所有公开 API。
+  - `touch_()` 只在持锁时调用，因此本身不加锁。
+- **capacity==0 的语义**：明确“禁用缓存”行为（put=false/get=nullopt/erase=false/size=0）。
+- **Debug-only 不变量**：
+  - `size_ == nodes_.size()`
+  - `size_ <= capacity_`
+  - `freq_list_` 中 key 数量总和 == `size_`
+  - `size_==0` 时 `minFreq_==0` 且结构为空
+  - `size_>0` 时 `minFreq_` 必须能在 `freq_list_` 中找到
+
+### minFreq_ 的维护策略（我们最终落地的版本）
+- 我们最终采取的是：
+  - `touch_()`：当旧桶空 && 旧桶是 `minFreq_` 时，直接 `minFreq_ = f + 1`。
+  - `erase()`：当删除导致桶空且桶是 `minFreq_` 时，扫描 `freq_list_` 找新的最小频次（`O(#buckets)`），保证强不变量。
+- 这样做的好处：
+  - `put()` 的淘汰路径可以直接 `find(minFreq_)`，不需要 while 懒修复。
+  - Debug 下更容易保证“不变量总是成立”，排错更快。
+
+### 测试的分层（建议长期保持）
+我们把测试分成两层：
+
+1) **接口通用测试（Contract Test）**：
+   - 文件：`tests/test_icache_basic.cpp`
+   - 作用：只验证 `ICache` 的基础语义，与策略无关。
+   - 典型用例：capacity==0、覆盖写 size 不变、erase 行为、基本 put/get。
+
+2) **策略专项测试（Policy Test）**：
+   - LRU：`tests/test_lru.cpp`
+   - LFU：`tests/test_lfu.cpp`
+   - 作用：验证策略核心行为（淘汰顺序、tie-break 规则等）。
+
+3) **并发 smoke test（冒烟）**：
+   - LRU/LFU 都有随机 put/get/erase 的并发用例。
+   - 只断言不变量（例如 `size() <= capacity()`）与“不崩溃”。
+   - 不做确定性淘汰断言（并发调度不可控，会让测试脆弱）。
+
+### 这次你应该记住的工程经验
+- “库化”的核心不是把代码变复杂，而是把 **契约（Contract）** 写清楚：
+  - 输入/输出语义
+  - 边界条件（capacity==0）
+  - 线程安全保证
+  - 不变量与复杂度
+- 测试也要“库化”：
+  - 通用语义写一份复用
+  - 策略差异单独测
+  - 并发只做 smoke，不做 deterministic 断言
+
+### 下一步建议
+- 如果你准备继续往 ARC / 分片缓存走：
+  - 先把“测试宏”抽成一个公共头（例如 `tests/test_common.h`），避免三份测试重复写宏（这属于低风险重构）。
+  - 或者继续保持现状也没问题；当测试越来越多时再抽。
+
+

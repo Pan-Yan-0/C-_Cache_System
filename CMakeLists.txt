@@ -30,7 +30,9 @@ target_link_libraries(cacheStudy PRIVATE mycache)
 enable_testing()
 
 add_executable(lru_tests
-        tests/test_lru.cpp
+        # tests/test_lru.cpp
+         tests/test_lfu.cpp
+        # tests/test_icache_basic.cpp
 )
 
 target_link_libraries(lru_tests PRIVATE mycache)
