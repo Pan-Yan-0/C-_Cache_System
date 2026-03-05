@@ -23,6 +23,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <memory>
 
 namespace mycache {
 
