@@ -17,5 +17,6 @@
 #include "mycache/ICache.h"
 #include "mycache/LRUCache.h"
 #include "mycache/LFUCache.h"
+#include "mycache/ARCCache.h"
 
 #endif // CACHESTUDY_MYCACHE_MYCACHE_H

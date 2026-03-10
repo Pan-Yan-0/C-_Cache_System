@@ -12,6 +12,7 @@ add_library(mycache STATIC
         include/mycache/LRUCache.h
         include/mycache/LFUCache.h
         include/mycache/ARCCache.h
+        src/bench_cache.cpp
 )
 
 # PUBLIC：mycache 自己编译需要；链接到 mycache 的目标也会继承该 include 路径
@@ -54,3 +55,15 @@ add_executable(icache_basic_tests
 target_link_libraries(icache_basic_tests PRIVATE mycache)
 
 add_test(NAME icache_basic_tests COMMAND icache_basic_tests)
+
+add_executable(arc_tests
+        tests/test_arc.cpp
+)
+
+target_link_libraries(arc_tests PRIVATE mycache)
+
+add_test(NAME arc_tests COMMAND arc_tests)
+
+
+add_executable(bench_cache src/bench_cache.cpp)
+target_link_libraries(bench_cache PRIVATE mycache)

@@ -17,7 +17,7 @@
 #include "mycache/LFUCache.h"
 #include "mycache/ICache.h"
 #include "mycache/LRUCache.h"
-
+#include "mycache/ARCCache.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -168,7 +168,9 @@ int main() {
     run_icache_basic_suite([](size_t cap) {
         return make_cache_int_int<LFUCache<int, int>>(cap);
     });
-
+    run_icache_basic_suite([](size_t cap) {
+        return make_cache_int_int<ARCCache<int, int>>(cap);
+    });
     std::cout << "All ICache basic tests passed." << std::endl;
     return 0;
 }

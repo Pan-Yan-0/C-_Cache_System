@@ -482,3 +482,512 @@
   - 或者继续保持现状也没问题；当测试越来越多时再抽。
 
 
+
+---
+
+## Step 8 进展：开始实现 ARC（Adaptive Replacement Cache）— put/replace/ghost 裁剪 + 学会 list::splice
+
+> 说明：本阶段仍坚持“我自己写代码，助手只做审阅与引导”。ARC 的 `ARCCache.h` 目前属于单线程版本（尚未加锁），并且 `get/erase` 还在开发中。
+
+### 8.1 先搞清 ARC 是什么（不是 LRU+LFU 的简单拼接）
+**核心概念（四个 LRU 列表）**
+- `T1`：真实缓存（有 value），偏“最近性”（新进入/只命中过一次的条目）
+- `T2`：真实缓存（有 value），偏“频繁性”（二次及以上命中的条目）
+- `B1`：ghost（只存 key），记录“最近从 T1 淘汰”的痕迹
+- `B2`：ghost（只存 key），记录“最近从 T2 淘汰”的痕迹
+
+**关键不变量/约束**
+- 真实缓存容量：`|T1| + |T2| <= c`
+- 全部痕迹总量：`|T1| + |T2| + |B1| + |B2| <= 2c`
+
+**自适应参数 `p` 的含义**
+- `p` 是“目标上给 T1 的配额（倾向最近性）”，范围 `0..c`。
+- 幽灵命中时调整：
+  - 命中 `B1`（说明最近性不够）→ `p` 增大（更偏 LRU）
+  - 命中 `B2`（说明频繁性不够）→ `p` 减小（更偏 LFU-ish）
+- `p` 的调整与“真实缓存是否满”无关；满与否只决定是否需要 `replace()` 腾位置。
+
+---
+
+### 8.2 put 的结构化写法：必须拆成 5 路互斥分支
+我们把 `put(key,value)` 拆成 5 路互斥分支，避免 `if (it1==end || it2==end)` 这种很绕的条件：
+1) `key ∈ T1`：更新 value，并把节点从 `T1 → T2`（二次命中升级为频繁段）
+2) `key ∈ T2`：更新 value，并把节点移动到 `T2` 头部（MRU）
+3) `key ∈ B1`：调整 `p`（增大），必要时 `replace()`，从 `B1` 删除 key，然后插入到 `T2`
+4) `key ∈ B2`：调整 `p`（减小），必要时 `replace()`，从 `B2` 删除 key，然后插入到 `T2`
+5) 四表都 miss：必要时 `replace()`，插入到 `T1`
+
+> 统一规则：**只要接下来要插入一个“真实条目”（进 T1/T2），就先检查是否真实满**：
+> - 若 `|T1|+|T2| == c`：必须 `replace()`
+> - 否则不需要
+
+---
+
+### 8.3 学会 std::list::splice：缓存实现里最重要的 O(1)“移动节点”工具
+**为什么不用 `std::move` 解决“命中后移动”？**
+- `std::move` 移的是“对象内容”，不是链表节点。
+- LRU/LFU/ARC 的关键是“命中后把节点挪到 MRU”，应该移动节点指针（O(1)），而不是拷贝/移动 pair。
+
+**splice 的两种缓存常用场景**
+- 同 list 内移动到头部（touch）：把某个 iterator 节点挪到 `begin()`
+- 跨 list 移动（T1 → T2）：把 iterator 从 `T1` 剪下来，挂到 `T2.begin()`
+
+**易错点**
+- `splice` 要明确 source list；同 list 也要用“三参数形式”。
+- 跨 list splice 后，必须更新对应 map：
+  - 从 source map erase
+  - 在 dest map 写入新 iterator
+
+---
+
+### 8.4 为什么谨慎使用 unordered_map::operator[]（不是不能用，而是容易埋雷）
+- `mp[key]` 在 key 不存在时会“悄悄插入默认值”，在缓存的多表状态机里容易隐藏 bug。
+- 当我们还在开发期时，更推荐：
+  - `find` 先判断是否存在
+  - 或者 `insert_or_assign/try_emplace`
+- 但当我们配套了 Debug-only 不变量检查后，`operator[]` 的风险会被大幅降低（因为错误状态会更早暴露）。
+
+---
+
+### 8.5 replace()：ARC 的“真实淘汰”函数（只做一件事）
+**replace 的职责（契约）**
+- 只在 `|T1| + |T2| == c`（真实满）时被调用
+- 从 `T1` 或 `T2` 淘汰 1 个真实条目，并把淘汰的 key 放入对应 ghost：
+  - 从 `T1` 淘汰（LRU/back）→ key 进 `B1`（MRU/front）
+  - 从 `T2` 淘汰（LRU/back）→ key 进 `B2`
+- `replace()` 不修改 `p`。
+
+**决策规则（第一版够用）**
+- 若 `!T1.empty()` 且 `|T1| > p`：淘汰 T1
+- 否则淘汰 T2（若 T2 为空则退化淘汰 T1）
+
+**实现细节要点**
+- 先取 victim key，再更新 list/map，避免 `back()` 多次取值导致顺序风险。
+- ghost 侧也要维护 `b?_mp_[key] = b?.begin()`（映射必须是 iterator，不是 bool）。
+
+---
+
+### 8.6 ghost 裁剪 repeat_ghost()：保证 total <= 2c
+**为什么要有 ghost 裁剪？**
+- B1/B2 不存 value，但它们是“历史痕迹”，数量必须受控，否则会无限增长。
+
+**工程上最稳的策略（我们采用的方向）**
+- `while (total > 2*c)`：每次删一个 ghost
+- 删除哪一个？优先删更大的那一边（维持大致平衡）：
+  - `if (|B1| > |B2|) pop B1.back() else pop B2.back()`
+- pop 时必须同步：`ghost_mp.erase(key)` + `ghost_list.pop_back()`
+
+**重要提醒（debug 上容易踩坑）**
+- 如果 `total <= 2c`，trim 应立即 return，不能 assert 误伤。
+- 如果进入 while 循环，理论上 `B1` 或 `B2` 至少有一个非空；断言应放在循环内部或写成更严格的防御。
+
+---
+
+### 8.7 Debug-only 不变量：帮助快速发现“map/list 不同步”
+本阶段写了几类 Debug-only 检查：
+- key 唯一性：同一个 key 不能同时存在于 `T1/T2/B1/B2` 的多个 map
+- iterator 正确性：map 中的 iterator 解引用后应指向同 key/value
+
+**经验**
+- Debug-only 的断言必须避免 UB：先判断 `find != end()` 再解引用。
+- 断言是“报警器”，不应过早追求完美；关键路径（replace/put）跑通后再逐步补强。
+
+---
+
+### 8.8 下一步（主线）
+1) 实现 `get(key)`（5 路分支：T1/T2 hit、ghost hit、miss）
+2) 实现 `erase(key)`（至少支持删 T1/T2；是否处理 ghost 取决于策略）
+3) 新增 ARC 专项测试：
+   - put/get 基础命中
+   - T1→T2 升级行为
+   - B1/B2 命中对 p 的影响（可用黑盒方式间接验证淘汰倾向变化）
+   - total 不变量（`<= 2c`）在大量 put 下依然成立
+
+
+---
+
+## Step 9：完成 ARCCache 的 get/erase + 接入 ICache 基础测试 + ARC 专项测试（含压力回归）
+
+> 本阶段关键词：ARC 的 ghost 语义、get 的返回值契约、erase 的工程语义（显式失效）、Debug-only 断言如何正确使用、以及如何把 ARC 加入测试与构建体系。
+
+### 9.1 我们解决了什么问题（本次对话在做什么）
+- 你完成了 ARC 的 `replace()` 与 `put()` 主流程后，开始实现 `get()` 与 `erase()`。
+- `get()` 初版出现了“命中却返回空 optional”的严重逻辑错误，我们把它修正为：
+  - `T1/T2 hit`：返回 value，并维护 T1→T2 升级 / T2 的 MRU
+  - `B1/B2 hit`：**返回 miss（nullopt）**，但会调整自适应参数 `p_`
+  - `miss`：返回 nullopt
+- `erase()` 的语义一开始不明确，我们先“定契约”，再按四表落地删除逻辑。
+- 当你把 ARC 接入 `icache_basic_tests` 后，又触发了一个 Debug-only 断言崩溃，我们定位并修复。
+- 最后新增了 `arc_tests`（专项测试）并加入一个确定性的压力回归用例。
+
+### 9.2 ARC 里为什么 ghost 命中仍然是 miss？（非常关键的语义）
+ARC 的四个表：
+- **真实缓存**：T1 / T2（存的是 `(K,V)`）
+- **幽灵缓存**：B1 / B2（只存 `K`，不存 `V`）
+
+因此：
+- `get(key)` 命中 T1/T2 才能返回 value。
+- `get(key)` 命中 B1/B2 本质上是：
+  - “我记得你来过，但我已经没有数据了”
+  - 所以 API 上仍然要返回 `std::nullopt`
+  - 但它会作为反馈信号，用来调整 `p`（ARC 的“自适应”来源）
+
+一句话记忆：
+> **ARC 中：B1/B2 hit 是“带反馈信号的 miss”。**
+
+### 9.3 get() 的典型坑与修复点
+- **坑 1：命中后没返回值**
+  - 现象：T1/T2 hit 也返回空 optional
+  - 修复：在 splice/move 之前或之后把 `V` 取出来，然后 `return value`。
+- **坑 2：Debug-only 检查写在 miss 分支**
+  - 你写了 `check_key_in_mp_only_(key)`，其契约是“key 必须且只能在四表之一”。
+  - 但 miss 场景下 key 就应该在 0 个表里，导致 `c==0`，断言炸。
+  - 这在 `icache_basic_tests` 中必然触发，因为通用测试会做“get 不存在 key”。
+
+工程经验（Debug-only 断言契约要和调用点一致）：
+- `check_key_in_mp_only_(key)`：只应在“你已知 key 必存在于某个表”时调用。
+- miss 分支要么不检查，要么单独提供 `check_key_absent_(key)`。
+
+### 9.4 erase() 的工程语义：显式失效（invalidate）要“彻底移除”
+我们最终建议并采用的语义是：
+- `erase(key)`：无论 key 在 `T1/T2/B1/B2` 的哪张表出现，都把它彻底移除。
+- `erase()` 不调整 `p`（`p` 的自适应只由访问模式驱动）。
+- 返回值：
+  - 删除到任何一个条目就返回 `true`
+  - 四表都没有则 `false`
+
+原因：
+- 工程里 `erase` 一般表示“外部显式删除/失效”，不应留下 ghost 继续影响自适应，否则调用者会困惑。
+
+### 9.5 ARC 专项测试（arc_tests）的测试分层思路
+我们保持与 LRU/LFU 一致的测试分层：
+- `icache_basic_tests`：接口契约测试（对 LRU/LFU/ARC 都跑）
+- `arc_tests`：ARC 策略专项测试（验证 ghost 语义、erase 语义、以及基本健壮性）
+
+本阶段新增的 ARC 测试覆盖：
+- **erase 删除真实条目**：T1/T2 场景
+- **ghost 语义**：构造 replace 后的 miss key，验证 get 仍然 miss；erase 能清掉该 key
+- **size 不变量**：混合 put/get/erase 下始终满足 `size() <= capacity()`
+- **确定性压力回归**：固定随机种子下的随机操作序列（可重复、可回归）
+
+注意：压力测试里我们不做“确定淘汰顺序”的断言，只断言强不变量：
+- 不崩溃
+- `size <= capacity`
+- put 后立刻 get 同 key 必须读回刚写入的值（cap>0）
+
+### 9.6 构建/工程补强（为了更像一个库）
+- 聚合头 `include/mycache/mycache.h` 补齐导出：
+  - 新增 `#include "mycache/ARCCache.h"`
+- `CMakeLists.txt` 新增 ARC 测试目标：
+  - `add_executable(arc_tests tests/test_arc.cpp)`
+  - `target_link_libraries(arc_tests PRIVATE mycache)`
+  - `add_test(NAME arc_tests COMMAND arc_tests)`
+
+### 9.7 小结：本阶段你真正掌握的东西
+- ARC vs LRU/LFU 的本质区别：B1/B2 ghost + 自适应参数 p。
+- `std::optional` 的契约写法：
+  - 命中就返回 value
+  - miss 返回 `std::nullopt`
+- Debug-only 断言要“契约匹配”：不要在 miss 分支用“必须存在”的断言。
+- 测试分层（Contract tests + Policy tests + Stress smoke）是工程里很常用的结构。
+
+### 9.8 仍然欠缺/后续可以做的方向
+- （可选）ARC 线程安全：像 LRU/LFU 一样加单大锁，以及对应的并发 smoke test。
+- 性能对比 benchmark：LRU/LFU/ARC 在同一访问序列下对比命中率与吞吐。
+- 进一步的 Debug-only 全局不变量：验证 map/list 结构一致性（iterator 指向正确节点）。
+
+---
+
+## Step 10：Benchmark 基准测试初版（LRU / LFU / ARC 命中率与吞吐对比）
+
+> 本阶段目标：先把 benchmark 的“完整骨架”搭起来——不是追求一次性做成最终版，而是先拥有一个**可运行、可比较、可继续扩展**的性能对比程序。
+
+### 10.1 这次对话在说什么
+- 你希望把缓存系统项目补上 benchmark，对 `LRU / LFU / ARC` 在**同一条访问序列**下进行公平对比。
+- 我们先明确 benchmark 的契约，再把 `src/bench_cache.cpp` 补成一个完整的基准程序。
+- 同时把这部分内容整理进学习日志，方便你后面反过来学习“为什么这样设计”。
+
+### 10.2 Benchmark 的核心原则：先保证“公平”，再谈“快不快”
+缓存策略比较里，最容易出问题的不是代码写不出来，而是**比较口径不一致**。
+
+我们这次先固定了几个原则：
+1. **同一条 trace 跑所有 cache**
+   - LRU、LFU、ARC 必须吃同一份操作序列，才能公平比较。
+2. **每个 cache 都从空状态开始**
+   - 不能让前一个策略跑完后的状态影响下一个策略。
+3. **hit rate 只统计 get**
+   - `put / erase` 不参与命中率分母。
+   - 否则“命中率”会掺入写入比例，指标会失真。
+4. **吞吐量按总操作数统计**
+   - 使用 `total_ops / elapsed_time`，直观反映整体处理速度。
+5. **固定随机种子，保证可复现**
+   - benchmark 结果允许有微小波动，但 workload 本身应可重复生成。
+
+### 10.3 先拆 benchmark 的三个层次
+为了不一上来就把代码写乱，我们把 benchmark 拆成三层：
+
+#### 第 1 层：Workload 生成层
+作用：生成一条“访问序列 trace”。
+
+当前已有两个 workload：
+- `createHotSetTrace(...)`
+  - 模拟热点访问（hot set）
+  - 适合看缓存对高局部性读流量的表现
+- `createScanHotTrace(...)`
+  - 模拟扫描干扰 + 热点访问
+  - 更适合看 ARC 这类策略对 scan pollution 的抵抗能力
+
+#### 第 2 层：执行层（runner）
+作用：把一条 trace 逐条喂给某个 cache，并记录统计结果。
+
+这个阶段新增了：
+- `BenchmarkResult`
+- `runBenchmark(...)`
+
+它负责：
+- 遍历 trace
+- 调用 `cache.get / put / erase`
+- 统计 `get_ops / put_ops / erase_ops`
+- 统计 `hits / misses`
+- 记录耗时
+
+#### 第 3 层：展示层（reporting）
+作用：把 benchmark 结果打印成人能看懂的表格。
+
+这个阶段新增了：
+- `printResultHeader()`
+- `printResultRow(...)`
+
+这样做的好处：
+- 后续如果你想把输出改成 CSV / Markdown / JSON，就不用改 workload 和 runner。
+
+### 10.4 为什么 `BenchmarkResult` 要单独做成结构体？
+因为 benchmark 不是“跑完就算”，而是要留下结果做比较。
+
+当前结构体里放了这些字段：
+- `cache_name`
+- `workload_name`
+- `total_ops`
+- `get_ops / put_ops / erase_ops`
+- `hits / misses`
+- `elapsed_ms`
+
+并提供两个派生指标函数：
+- `hit_rate()`
+- `throughput_ops_per_sec()`
+
+这种写法的工程好处：
+- **统计原始数据** 和 **计算展示指标** 分开
+- 将来你要新增：
+  - 平均每次操作耗时
+  - p50/p95/p99
+  - 写命中率 / 读命中率
+  都比较容易扩展
+
+### 10.5 为什么 `runBenchmark(...)` 的参数设计成这样？
+当前形式：
+- `cache_name`
+- `ICache<int,int>& cache`
+- `const Trace& trace`
+- `workload_name`
+
+这是一个很典型的“策略无关 benchmark 执行器”。
+
+它的设计重点是：
+- **只依赖 ICache 接口**
+  - 这体现了你前面做接口抽象的价值。
+  - 后续你再加新算法时，只要实现 `ICache`，benchmark 不需要重写。
+- **trace 作为只读输入**
+  - 所有策略共享一份操作序列，保证公平。
+- **每次运行都返回一个结果对象**
+  - 方便汇总、排序、打印、导出。
+
+### 10.6 这次补上的边界处理
+在写 benchmark 时，我们顺手修了几个 trace 生成的边界问题：
+
+#### `createHotSetTrace(...)`
+新增防御：
+- `ops == 0` 直接返回空 trace
+- `key_space == 0` 直接返回空 trace
+- `hotset_size == 0` 时，不走热点分支，统一退化到全空间随机
+
+#### `createScanHotTrace(...)`
+新增防御：
+- `ops == 0` 直接返回空 trace
+- `key_space == 0` 直接返回空 trace
+- `scan_batch_size == 0` 时强制修正为 1
+- `hotset_size == 0` 时，跳过“插入热点访问”阶段，退化为纯 scan 流量
+
+这些边界处理的意义：
+- benchmark 是“实验工具”，越不容易因为奇怪参数崩掉越好。
+- 你以后可能会反复调参数，边界处理能省很多排错时间。
+
+### 10.7 当前 main 的职责：先做一个“最小可运行 benchmark”
+`main()` 现在不再只是打印随机数，而是完成了最小可运行流程：
+
+1. 定义一份 `BenchmarkConfig`
+2. 固定随机种子
+3. 生成两条 trace：
+   - HotSet
+   - ScanHot
+4. 分别创建：
+   - LRU
+   - LFU
+   - ARC
+5. 对两条 trace 分别跑三种策略
+6. 输出结果表格
+
+这一步非常重要，因为它标志着：
+> 你的 benchmark 已经从“想法”变成“可执行程序”了。
+
+### 10.8 这版 benchmark 还不是什么？
+虽然它已经能工作，但它还不是最终版，当前還沒有做這些高級內容：
+- 多轮重复运行取平均值
+- 预热（warmup）与正式计时分离
+- 不同容量的 sweep（例如 64 / 128 / 256）
+- CSV/JSON 导出
+- 更复杂的 workload（例如 Zipf 分布）
+- 并发 benchmark（当前还是单线程策略比较）
+- 延迟分位数（p50 / p95 / p99）
+
+所以你可以把它理解为：
+- **benchmark v1：结构完整、指标清楚、可继续扩展**
+- 不是最终性能实验平台
+
+### 10.9 这一阶段真正值得学的工程点
+1. **先定义指标，再写代码**
+   - 命中率怎么算？吞吐量怎么算？要先定契约。
+2. **把 benchmark 分层**
+   - workload / runner / reporting 分开，比全写在 main 里好维护得多。
+3. **统一接口的价值**
+   - `ICache` 让 LRU/LFU/ARC 能被同一个 runner 驱动。
+4. **可复现性很重要**
+   - 固定 seed 是 benchmark 的基本素养。
+5. **边界参数要防御**
+   - benchmark 代码也是工程代码，不只是临时脚本。
+
+### 10.10 下一步建议（你学习时可以按这个顺序看）
+当你准备真正“学习如何自己写这部分代码”时，可以按这个顺序来：
+
+1. 先只看 `TraceEntry / Trace / OpType`
+   - 理解“访问序列”为什么要先抽象出来
+2. 再看两个 trace 生成函数
+   - 重点理解 workload 在模拟什么业务场景
+3. 再看 `BenchmarkResult`
+   - 思考为什么这些字段足够支撑当前比较
+4. 最后看 `runBenchmark(...)`
+   - 它就是 benchmark 的核心执行器
+5. 最后再看 `main()`
+   - 它只是把前面这些模块串起来
+
+一句话总结这一步：
+> 我们先把 benchmark 搭成了一个“可以跑、可以看、可以继续演化”的最小框架，后面你再来学习每一层为什么这样写。
+
+### 10.11 新增第三种 workload：Random（完全随机）
+为了让 benchmark 更完整，我们又补了一种最基础的基线负载：
+
+- `createRandomTrace(...)`
+
+它的特点是：
+- key 完全均匀随机落在 `[0, key_space)`
+- 操作类型也随机：
+  - `read_ratio` 概率生成 `Get`
+  - 剩余写操作里，90% 是 `Put`
+  - 10% 是 `Erase`
+- 没有热点
+- 没有扫描模式
+- 没有额外的访问局部性设计
+
+#### 为什么这个 workload 很重要？
+因为前两个 workload 都带有“结构性”：
+- `HotSet`：偏高局部性
+- `ScanHot`：偏扫描干扰 + 热点混合
+
+而 `Random` 更像一个“基线场景”：
+- 如果访问模式几乎没有局部性
+- 那么各种缓存策略通常都不会表现得特别好
+- 命中率一般会明显低于 `HotSet`
+
+所以它的价值不是“让某个策略赢”，而是：
+> 给 benchmark 提供一个没有明显偏向的参照组。
+
+#### 三种 workload 现在分别在测什么？
+1. **HotSet**
+   - 测试缓存面对高热点访问时的表现
+   - 命中率通常较高
+2. **ScanHot**
+   - 测试缓存面对扫描污染时的抗干扰能力
+   - ARC 往往在这类场景更有优势
+3. **Random**
+   - 测试在弱局部性、近乎纯随机访问下的基线表现
+   - 更适合作为“保底参照”而不是“优势场景”
+
+#### 工程上的小变化
+- `main()` 现在会生成第三条 trace：`random_trace`
+- benchmark 结果从原来的 6 行（2 workloads × 3 caches）变成 9 行（3 workloads × 3 caches）
+- `results.reserve(...)` 也同步从 6 改成 9
+
+这样一来，当前 benchmark v1 已经具备了三类典型模式：
+- 有热点
+- 有扫描干扰
+- 纯随机基线
+
+这会让后面你分析命中率与吞吐时，结论更有说服力。
+
+---
+
+## Step 10-B：Benchmark 完整版（多轮 + 预热 + 汇总 + 讲解文档）
+
+> 本阶段目标：把 benchmark 从“能跑”升级为“更可信、可解释、便于学习复盘”的版本。
+
+### 10-B.1 这次做了什么
+- 在 `bench_cache.cpp` 中补齐了多轮 benchmark 流程：
+  - `warmup_rounds`（预热轮，不计入结果）
+  - `rounds`（正式计时轮）
+- 新增多轮汇总结构 `BenchmarkSummary`：
+  - 命中率/耗时/吞吐都给出 `avg + min + max`
+- benchmark 主流程改为“workload × cache”的双层循环：
+  - 避免重复代码，后续新增 workload 或策略更轻松
+- 输出表头与行格式做了增强：
+  - 增加 `Gets / Puts / Erases`
+  - 增加 `Hit(min~max)` 与 `Thr(min~max)`
+- 修正了范围输出的格式化方式：
+  - 从 `to_string + substr` 改为统一格式化函数（更稳定、更易读）
+
+### 10-B.2 为什么要加 warmup 和多轮
+单次 benchmark 常见问题：
+- 冷启动影响大（缓存对象刚创建、运行时状态未稳定）
+- 调度/系统噪声会造成偶发抖动
+
+改成“预热 + 多轮”后：
+- 结果更稳定
+- 观察波动范围更直观
+- 更容易判断“策略差距是真差距还是噪声”
+
+### 10-B.3 这版 benchmark 的工程价值
+这次不是简单“加功能”，而是把 benchmark 变成可复用的小框架：
+
+1. **可复现**：固定 seed + 固定参数
+2. **可解释**：输出口径清晰（命中率只看 Get，吞吐看总操作）
+3. **可扩展**：新增 workload/策略时只需补描述与构造，不用复制大段主流程
+4. **可教学**：代码分层（生成 / 执行 / 汇总 / 输出）清晰
+
+### 10-B.4 新增配套文档
+新增：`notes/benchmark-guide.md`
+
+文档覆盖：
+- benchmark 的问题定义
+- 三种 workload 的意义
+- 关键函数职责和设计理由
+- C++ 特性点（optional / chrono / [[nodiscard]] 等）
+- 后续扩展方向（capacity sweep、CSV 导出、Zipf workload）
+
+### 10-B.5 目前 benchmark状态（阶段结论）
+- [x] HotSet / ScanHot / Random 三种 workload
+- [x] LRU / LFU / ARC 同 trace 公平对比
+- [x] warmup + 多轮 measured 汇总
+- [x] avg + min/max 输出
+- [x] 学习型讲解文档落地
+
+一句话总结：
+> benchmark 已经从“实验草稿”升级为“可复现、可解释、可继续演化”的工程化版本。
